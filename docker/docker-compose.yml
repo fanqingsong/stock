@@ -1,31 +1,37 @@
-version: '4.0.0'
-
 services:
   instockdbservice:
-    image: library/mariadb:latest
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/mariadb:latest
     container_name: InStockDbService
     environment:
       MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: instockdb
     volumes:
-      - /data/mariadb/data:/var/lib/instockdb
+      - ./data/mariadb:/var/lib/mysql
     networks:
       - instock_network
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   instock:
-    image: mayanghua/instock:latest
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/mayanghua/instock:latest
     container_name: InStock
     ports:
       - "9988:9988"
     environment:
       db_host: InStockDbService
     volumes:
-      - /data/instockproxy.txt:/data/InStock/instock/config/proxy.txt
+      - ./data/instockproxy.txt:/data/InStock/instock/config/proxy.txt
+      # 使用本地代码：修复 push2 不可用（改走 push2delay）并支持分页抓取
+      - ../instock:/data/InStock/instock
     depends_on:
-      - instockdbservice
+      instockdbservice:
+        condition: service_healthy
     networks:
       - instock_network
 
 networks:
   instock_network:
     driver: bridge
-

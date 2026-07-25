@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -9,6 +10,13 @@ from pathlib import Path
 import time
 import random
 from instock.core.singleton_proxy import proxys
+
+# push2.* 在部分网络下会被断开，push2delay 可用且兼容同一套 clist API
+_PUSH2_HOST_RE = re.compile(r'^https?://(?:\d+\.)?push2\.eastmoney\.com(?=/|$)', re.I)
+
+
+def _normalize_eastmoney_url(url: str) -> str:
+    return _PUSH2_HOST_RE.sub('https://push2delay.eastmoney.com', url)
 
 __author__ = 'myh '
 __date__ = '2025/12/31 '
@@ -75,7 +83,8 @@ class eastmoney_fetcher:
             'Referer': 'https://quote.eastmoney.com/',
             'Accept': '*/*',
             'Accept-Language': 'zh-CN,zh;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br, zstd',
+            # 仅声明 requests 可自动解压的编码；br/zstd 会导致拿到未解压二进制从而 JSON 解析失败
+            'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
         }
         session.headers.update(headers)
@@ -92,6 +101,7 @@ class eastmoney_fetcher:
         :param timeout: 超时时间
         :return: 响应对象
         """
+        url = _normalize_eastmoney_url(url)
         for i in range(retry):
             try:
                 response = self.session.get(
@@ -121,6 +131,7 @@ class eastmoney_fetcher:
         :param timeout: 超时时间
         :return: 响应对象
         """
+        url = _normalize_eastmoney_url(url)
         for i in range(retry):
             try:
                 response = self.session.post(

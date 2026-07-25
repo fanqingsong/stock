@@ -7,8 +7,9 @@ Desc: 东方财富网-行情首页-沪深京 A 股
 import random
 import time
 
-import pandas as pd
 import math
+import numpy as np
+import pandas as pd
 from functools import lru_cache
 from instock.core.eastmoney_fetcher import eastmoney_fetcher
 
@@ -17,6 +18,8 @@ __date__ = '2025/12/31 '
 
 # 创建全局实例，供所有函数使用
 fetcher = eastmoney_fetcher()
+# push2his 不可用时，后续请求直接走腾讯回退，避免反复超时
+_EASTMONEY_HIST_DISABLED = False
 
 def stock_zh_a_spot_em() -> pd.DataFrame:
     """
@@ -51,7 +54,7 @@ def stock_zh_a_spot_em() -> pd.DataFrame:
     page_count = math.ceil(data_count/page_size)
     while page_count > 1:
         # 添加随机延迟，避免爬取过快
-        time.sleep(random.uniform(1, 1.5))
+        time.sleep(random.uniform(0.2, 0.5))
         page_current = page_current + 1
         params["pn"] = page_current
         r =  fetcher.make_request(url, params=params)
@@ -310,6 +313,118 @@ def code_id_map_em() -> dict:
     return code_id_dict
 
 
+def _symbol_to_tencent_code(symbol: str) -> str:
+    if symbol.startswith('6'):
+        return f"sh{symbol}"
+    if symbol.startswith(('4', '8')):
+        return f"bj{symbol}"
+    return f"sz{symbol}"
+
+
+def _hist_from_sina(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """新浪日K回退源（东财/腾讯不可用时使用）。volume 原单位为股，这里折算为手以兼容后续 *100。"""
+    import requests
+    code = _symbol_to_tencent_code(symbol)
+    url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+    r = requests.get(
+        url,
+        params={"symbol": code, "scale": "240", "ma": "no", "datalen": "800"},
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://finance.sina.com.cn/",
+            "Accept-Encoding": "gzip, deflate",
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    rows = r.json()
+    if not rows:
+        return pd.DataFrame()
+    temp_df = pd.DataFrame(rows)
+    temp_df = temp_df.rename(columns={
+        "day": "日期", "open": "开盘", "high": "最高", "low": "最低", "close": "收盘", "volume": "成交量",
+    })
+    for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
+        temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
+    # 股 -> 手
+    temp_df["成交量"] = temp_df["成交量"] / 100.0
+
+    start_fmt = f"{start_date[0:4]}-{start_date[4:6]}-{start_date[6:8]}" if len(start_date) == 8 else start_date
+    end_fmt = f"{end_date[0:4]}-{end_date[4:6]}-{end_date[6:8]}" if len(end_date) == 8 else end_date
+    temp_df = temp_df[(temp_df["日期"] >= start_fmt) & (temp_df["日期"] <= end_fmt)].copy()
+    if temp_df.empty:
+        return pd.DataFrame()
+
+    prev_close = temp_df["收盘"].shift(1)
+    temp_df["涨跌额"] = temp_df["收盘"] - prev_close
+    temp_df["涨跌幅"] = (temp_df["涨跌额"] / prev_close.replace(0, np.nan)) * 100
+    temp_df["振幅"] = ((temp_df["最高"] - temp_df["最低"]) / prev_close.replace(0, np.nan)) * 100
+    typical = (temp_df["开盘"] + temp_df["收盘"] + temp_df["最高"] + temp_df["最低"]) / 4.0
+    temp_df["成交额"] = typical * temp_df["成交量"] * 100.0
+    temp_df["换手率"] = 0.0
+    temp_df = temp_df.fillna(0.0)
+    return temp_df[
+        ["日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌幅", "涨跌额", "换手率"]
+    ]
+
+
+def _hist_from_tencent(symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
+    """腾讯前复权日K回退源（push2his 不可用时使用）。"""
+    import requests
+    adj = "qfq" if adjust in ("", "qfq") else ("hfq" if adjust == "hfq" else "")
+    code = _symbol_to_tencent_code(symbol)
+    # 约 3 年交易日；腾讯单次常见上限约 800
+    param = f"{code},day,,,800,{adj}" if adj else f"{code},day,,,800"
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    r = requests.get(
+        url,
+        params={"param": param},
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://gu.qq.com/",
+            "Accept-Encoding": "gzip, deflate",
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    data_json = r.json()
+    payload = data_json.get("data") or {}
+    if not isinstance(payload, dict) or not payload:
+        return pd.DataFrame()
+    stock_payload = payload.get(code) or next(iter(payload.values()), {})
+    rows = stock_payload.get("qfqday") or stock_payload.get("hfqday") or stock_payload.get("day") or []
+    if not rows:
+        return pd.DataFrame()
+
+    # 腾讯字段: 日期, 开盘, 收盘, 最高, 最低, 成交量(手)
+    temp_df = pd.DataFrame(rows)
+    temp_df = temp_df.iloc[:, :6]
+    temp_df.columns = ["日期", "开盘", "收盘", "最高", "最低", "成交量"]
+    for col in ["开盘", "收盘", "最高", "最低", "成交量"]:
+        temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
+
+    # 过滤日期区间（YYYYMMDD）
+    start_fmt = f"{start_date[0:4]}-{start_date[4:6]}-{start_date[6:8]}" if len(start_date) == 8 else start_date
+    end_fmt = f"{end_date[0:4]}-{end_date[4:6]}-{end_date[6:8]}" if len(end_date) == 8 else end_date
+    temp_df = temp_df[(temp_df["日期"] >= start_fmt) & (temp_df["日期"] <= end_fmt)].copy()
+    if temp_df.empty:
+        return pd.DataFrame()
+
+    prev_close = temp_df["收盘"].shift(1)
+    temp_df["涨跌额"] = temp_df["收盘"] - prev_close
+    temp_df["涨跌幅"] = (temp_df["涨跌额"] / prev_close.replace(0, np.nan)) * 100
+    temp_df["振幅"] = ((temp_df["最高"] - temp_df["最低"]) / prev_close.replace(0, np.nan)) * 100
+    # 成交额(元) ≈ 均价 * 成交量(手) * 100，兼容后续 volume*100 后的均价计算
+    typical = (temp_df["开盘"] + temp_df["收盘"] + temp_df["最高"] + temp_df["最低"]) / 4.0
+    temp_df["成交额"] = typical * temp_df["成交量"] * 100.0
+    temp_df["换手率"] = 0.0
+    temp_df = temp_df.fillna(0.0)
+    temp_df = temp_df[
+        ["日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌幅", "涨跌额", "换手率"]
+    ]
+    return temp_df
+
+
 def stock_zh_a_hist(
     symbol: str = "000001",
     period: str = "daily",
@@ -333,10 +448,10 @@ def stock_zh_a_hist(
     :return: 每日行情
     :rtype: pandas.DataFrame
     """
-    code_id_dict = code_id_map_em()
+    # 无需拉取全市场 code_id_map：secid 可由代码前缀直接判定（避免多线程重复全量分页）
     adjust_dict = {"qfq": "1", "hfq": "2", "": "0"}
     period_dict = {"daily": "101", "weekly": "102", "monthly": "103"}
-    url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
@@ -348,41 +463,59 @@ def stock_zh_a_hist(
         "end": end_date,
         "_": "1623766962675",
     }
-    r =  fetcher.make_request(url, params=params)
-    data_json = r.json()
-    if not (data_json["data"] and data_json["data"]["klines"]):
+    global _EASTMONEY_HIST_DISABLED
+    if not _EASTMONEY_HIST_DISABLED:
+        try:
+            # 使用短超时；失败后禁用东财历史源，避免全市场重复重试
+            r = fetcher.make_request(url, params=params, retry=1, timeout=5)
+            data_json = r.json()
+            if data_json.get("data") and data_json["data"].get("klines"):
+                temp_df = pd.DataFrame(
+                    [item.split(",") for item in data_json["data"]["klines"]]
+                )
+                temp_df.columns = [
+                    "日期",
+                    "开盘",
+                    "收盘",
+                    "最高",
+                    "最低",
+                    "成交量",
+                    "成交额",
+                    "振幅",
+                    "涨跌幅",
+                    "涨跌额",
+                    "换手率",
+                ]
+                temp_df.index = pd.to_datetime(temp_df["日期"])
+                temp_df.reset_index(inplace=True, drop=True)
+
+                temp_df["开盘"] = pd.to_numeric(temp_df["开盘"])
+                temp_df["收盘"] = pd.to_numeric(temp_df["收盘"])
+                temp_df["最高"] = pd.to_numeric(temp_df["最高"])
+                temp_df["最低"] = pd.to_numeric(temp_df["最低"])
+                temp_df["成交量"] = pd.to_numeric(temp_df["成交量"])
+                temp_df["成交额"] = pd.to_numeric(temp_df["成交额"])
+                temp_df["振幅"] = pd.to_numeric(temp_df["振幅"])
+                temp_df["涨跌幅"] = pd.to_numeric(temp_df["涨跌幅"])
+                temp_df["涨跌额"] = pd.to_numeric(temp_df["涨跌额"])
+                temp_df["换手率"] = pd.to_numeric(temp_df["换手率"])
+                return temp_df
+        except Exception:
+            _EASTMONEY_HIST_DISABLED = True
+
+    # 东方财富历史接口不可用时，依次回退腾讯 / 新浪
+    if period != "daily":
         return pd.DataFrame()
-    temp_df = pd.DataFrame(
-        [item.split(",") for item in data_json["data"]["klines"]]
-    )
-    temp_df.columns = [
-        "日期",
-        "开盘",
-        "收盘",
-        "最高",
-        "最低",
-        "成交量",
-        "成交额",
-        "振幅",
-        "涨跌幅",
-        "涨跌额",
-        "换手率",
-    ]
-    temp_df.index = pd.to_datetime(temp_df["日期"])
-    temp_df.reset_index(inplace=True, drop=True)
-
-    temp_df["开盘"] = pd.to_numeric(temp_df["开盘"])
-    temp_df["收盘"] = pd.to_numeric(temp_df["收盘"])
-    temp_df["最高"] = pd.to_numeric(temp_df["最高"])
-    temp_df["最低"] = pd.to_numeric(temp_df["最低"])
-    temp_df["成交量"] = pd.to_numeric(temp_df["成交量"])
-    temp_df["成交额"] = pd.to_numeric(temp_df["成交额"])
-    temp_df["振幅"] = pd.to_numeric(temp_df["振幅"])
-    temp_df["涨跌幅"] = pd.to_numeric(temp_df["涨跌幅"])
-    temp_df["涨跌额"] = pd.to_numeric(temp_df["涨跌额"])
-    temp_df["换手率"] = pd.to_numeric(temp_df["换手率"])
-
-    return temp_df
+    try:
+        df = _hist_from_tencent(symbol, start_date, end_date, adjust)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+    try:
+        return _hist_from_sina(symbol, start_date, end_date)
+    except Exception:
+        return pd.DataFrame()
 
 
 def stock_zh_a_hist_min_em(
